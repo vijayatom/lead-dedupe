@@ -32,10 +32,10 @@ export default function Home() {
       .then((r) => r.json())
       .then((j) => {
         setDbTotal(typeof j.totalEmails === "number" ? j.totalEmails : 0);
-        // Local dev uses a JSON file (fine). On a deployed URL, only Postgres counts.
+        // Local dev uses a JSON file (fine). On a deployed URL, only the Blob store counts.
         const h = window.location.hostname;
         const isLocal = h === "localhost" || h === "127.0.0.1";
-        setDbOk(j.dbConnected === false ? false : isLocal ? true : j.postgres === true);
+        setDbOk(j.connected === false ? false : isLocal ? true : j.connected !== false);
       })
       .catch(() => setDbOk(false));
   }, []);

@@ -10,7 +10,7 @@
     "seed": "node scripts/seed.mjs"
   },
   "dependencies": {
-    "@neondatabase/serverless": "^0.10.4",
+    "@vercel/blob": "^2.8.2",
     "next": "^14.2.0",
     "papaparse": "^5.4.1",
     "react": "^18.3.1",

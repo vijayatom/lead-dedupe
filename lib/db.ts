@@ -1,32 +1,60 @@
-import { Client } from "@neondatabase/serverless";
+import { head, list, put } from "@vercel/blob";
 import { promises as fs } from "fs";
 import path from "path";
 
-// Storage abstraction:
-// - Production (DATABASE_URL set, i.e. Neon connected): Postgres.
-// - Local dev without DATABASE_URL: JSON file at data/db.json.
-// Prod refuses to run without DATABASE_URL so leads are never silently lost.
+// Storage:
+// - BLOB_READ_WRITE_TOKEN set (Vercel prod/preview, or local via `vercel env pull`):
+//   durable Vercel Blob store shared by every deployment.
+// - Otherwise (fresh local dev): JSON file at data/db.json.
 
+const EMAILS_KEY = "lead-dedupe/emails.json";
+const CAMPAIGNS_KEY = "lead-dedupe/campaigns.json";
 const DB_FILE = path.join(process.cwd(), "data", "db.json");
 
-const SCHEMA = [
-  `CREATE TABLE IF NOT EXISTS emails (
-    email TEXT PRIMARY KEY,
-    campaign TEXT NOT NULL DEFAULT 'seed',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )`,
-  `CREATE TABLE IF NOT EXISTS campaigns (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    total_rows INT NOT NULL DEFAULT 0,
-    new_count INT NOT NULL DEFAULT 0,
-    dup_count INT NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_emails_created ON emails (created_at DESC)`,
-];
+type Campaign = {
+  name: string;
+  total_rows: number;
+  new_count: number;
+  dup_count: number;
+  created_at: string;
+};
 
-type LocalDB = { emails: Record<string, string>; campaigns: unknown[] };
+function useBlob() {
+  return !!process.env.BLOB_READ_WRITE_TOKEN;
+}
+
+async function readBlob<T>(key: string, fallback: T): Promise<T> {
+  try {
+    const blobs = await list({ prefix: key });
+    const hit = blobs.blobs.find((b) => b.pathname === key);
+    if (!hit) return fallback;
+    // Private blobs need auth on read: signed downloadUrl alone 403s from
+    // some networks, so always send the RW token when we have it.
+    const headers: Record<string, string> = {};
+    if (process.env.BLOB_READ_WRITE_TOKEN) {
+      headers.Authorization = `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}`;
+    }
+    const res = await fetch(hit.downloadUrl || hit.url, {
+      headers,
+      cache: "no-store",
+    });
+    if (!res.ok) return fallback;
+    return (await res.json()) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeBlob(key: string, value: unknown) {
+  await put(key, JSON.stringify(value), {
+    access: "private",
+    contentType: "application/json",
+    addRandomSuffix: false,
+    allowOverwrite: true,
+  });
+}
+
+type LocalDB = { emails: Record<string, string>; campaigns: Campaign[] };
 
 async function readLocal(): Promise<LocalDB> {
   try {
@@ -43,25 +71,13 @@ async function writeLocal(db: LocalDB) {
   await fs.writeFile(DB_FILE, JSON.stringify(db));
 }
 
-function usePostgres() {
-  return !!process.env.DATABASE_URL;
-}
-
-async function withClient<T>(fn: (c: Client) => Promise<T>): Promise<T> {
-  const client = new Client(process.env.DATABASE_URL!);
-  await client.connect();
-  try {
-    return await fn(client);
-  } finally {
-    await client.end();
-  }
-}
-
 export async function ensureSchema() {
-  if (!usePostgres()) return;
-  await withClient(async (c) => {
-    for (const stmt of SCHEMA) await c.query(stmt);
-  });
+  if (!useBlob()) return;
+  // Existence check only — never overwrite. (A failed read must not wipe data.)
+  const { blobs } = await list({ prefix: "lead-dedupe/" });
+  const names = new Set(blobs.map((b) => b.pathname));
+  if (!names.has(EMAILS_KEY)) await writeBlob(EMAILS_KEY, {});
+  if (!names.has(CAMPAIGNS_KEY)) await writeBlob(CAMPAIGNS_KEY, []);
 }
 
 export async function checkEmails(
@@ -69,20 +85,11 @@ export async function checkEmails(
 ): Promise<{ email: string; campaign: string }[]> {
   const uniq = Array.from(new Set(emails.map((e) => e.toLowerCase())));
   if (uniq.length === 0) return [];
-  if (usePostgres()) {
-    return withClient(async (c) => {
-      // chunk to stay under parameter limits
-      const out: { email: string; campaign: string }[] = [];
-      for (let i = 0; i < uniq.length; i += 1000) {
-        const batch = uniq.slice(i, i + 1000);
-        const { rows } = await c.query(
-          "SELECT email, campaign FROM emails WHERE email = ANY($1)",
-          [batch]
-        );
-        out.push(...(rows as { email: string; campaign: string }[]));
-      }
-      return out;
-    });
+  if (useBlob()) {
+    const store = await readBlob<Record<string, string>>(EMAILS_KEY, {});
+    return uniq
+      .filter((e) => e in store)
+      .map((e) => ({ email: e, campaign: store[e] }));
   }
   const db = await readLocal();
   return uniq
@@ -101,72 +108,59 @@ export async function commitEmails(
     const k = e.email.toLowerCase();
     if (!uniq.has(k)) uniq.set(k, e.campaign);
   }
-  const list = Array.from(uniq.entries());
-  if (usePostgres()) {
-    return withClient(async (c) => {
-      let inserted = 0;
-      for (let i = 0; i < list.length; i += 500) {
-        const batch = list.slice(i, i + 500);
-        const values = batch
-          .map((_, j) => `($${j * 2 + 1}, $${j * 2 + 2})`)
-          .join(", ");
-        const params = batch.flatMap(([email, campaign]) => [email, campaign]);
-        const res = await c.query(
-          `INSERT INTO emails (email, campaign) VALUES ${values} ON CONFLICT (email) DO NOTHING`,
-          params
-        );
-        inserted += res.rowCount ?? 0;
+  const record: Campaign = {
+    name: campaignName,
+    total_rows: totalRows,
+    new_count: 0,
+    dup_count: dupCount,
+    created_at: new Date().toISOString(),
+  };
+  if (useBlob()) {
+    const store = await readBlob<Record<string, string>>(EMAILS_KEY, {});
+    let inserted = 0;
+    for (const [email, campaign] of Array.from(uniq.entries())) {
+      if (!(email in store)) {
+        store[email] = campaign;
+        inserted++;
       }
-      await c.query(
-        "INSERT INTO campaigns (name, total_rows, new_count, dup_count) VALUES ($1, $2, $3, $4)",
-        [campaignName, totalRows, inserted, dupCount]
-      );
-      return { inserted };
-    });
+    }
+    await writeBlob(EMAILS_KEY, store);
+    record.new_count = inserted;
+    const camps = await readBlob<Campaign[]>(CAMPAIGNS_KEY, []);
+    camps.push(record);
+    await writeBlob(CAMPAIGNS_KEY, camps);
+    return { inserted };
   }
   const db = await readLocal();
   let inserted = 0;
-  for (const [email, campaign] of list) {
+  for (const [email, campaign] of Array.from(uniq.entries())) {
     if (!(email in db.emails)) {
       db.emails[email] = campaign;
       inserted++;
     }
   }
-  (db.campaigns as unknown[]).push({
-    name: campaignName,
-    total_rows: totalRows,
-    new_count: inserted,
-    dup_count: dupCount,
-    created_at: new Date().toISOString(),
-  });
+  record.new_count = inserted;
+  db.campaigns.push(record);
   await writeLocal(db);
   return { inserted };
 }
 
 export async function getStats() {
-  if (usePostgres()) {
-    return withClient(async (c) => {
-      const total = await c.query("SELECT COUNT(*)::int AS c FROM emails");
-      let campaigns: unknown[] = [];
-      try {
-        const r = await c.query(
-          "SELECT name, total_rows, new_count, dup_count, created_at FROM campaigns ORDER BY created_at DESC LIMIT 20"
-        );
-        campaigns = r.rows;
-      } catch {
-        campaigns = [];
-      }
-      return {
-        totalEmails: (total.rows[0] as { c: number }).c,
-        campaigns,
-        postgres: true,
-      };
-    });
+  if (useBlob()) {
+    const [store, camps] = await Promise.all([
+      readBlob<Record<string, string>>(EMAILS_KEY, {}),
+      readBlob<Campaign[]>(CAMPAIGNS_KEY, []),
+    ]);
+    return {
+      totalEmails: Object.keys(store).length,
+      campaigns: [...camps].reverse().slice(0, 20),
+      connected: true,
+    };
   }
   const db = await readLocal();
   return {
     totalEmails: Object.keys(db.emails).length,
-    campaigns: (db.campaigns as unknown[]).slice(-20).reverse(),
-    postgres: false,
+    campaigns: [...db.campaigns].reverse().slice(0, 20),
+    connected: false,
   };
 }

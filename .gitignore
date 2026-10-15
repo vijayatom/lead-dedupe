@@ -5,3 +5,5 @@ out/
 .env*.local
 data/db.json
 tsconfig.tsbuildinfo
+.vercel
+.env*

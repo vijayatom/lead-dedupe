@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+
+export const dynamic = "force-dynamic";
 import { checkEmails, ensureSchema } from "@/lib/db";
 
 export async function POST(req: Request) {
@@ -6,7 +8,7 @@ export async function POST(req: Request) {
     await ensureSchema();
   } catch (e) {
     return NextResponse.json(
-      { error: "Database not connected. Add Neon Postgres in the Vercel dashboard." },
+      { error: "Database not connected. Blob store missing." },
       { status: 500 }
     );
   }
