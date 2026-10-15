@@ -1,0 +1,25 @@
+{
+  "name": "lead-dedupe",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Upload a CSV, find emails already contacted, download only new leads.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "seed": "node scripts/seed.mjs"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.4",
+    "next": "^14.2.0",
+    "papaparse": "^5.4.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/papaparse": "^5.3.14",
+    "@types/react": "^18.3.0",
+    "typescript": "^5.4.0"
+  }
+}
