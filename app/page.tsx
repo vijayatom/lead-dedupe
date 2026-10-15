@@ -32,7 +32,10 @@ export default function Home() {
       .then((r) => r.json())
       .then((j) => {
         setDbTotal(typeof j.totalEmails === "number" ? j.totalEmails : 0);
-        setDbOk(j.dbConnected === false ? false : true);
+        // Local dev uses a JSON file (fine). On a deployed URL, only Postgres counts.
+        const h = window.location.hostname;
+        const isLocal = h === "localhost" || h === "127.0.0.1";
+        setDbOk(j.dbConnected === false ? false : isLocal ? true : j.postgres === true);
       })
       .catch(() => setDbOk(false));
   }, []);
