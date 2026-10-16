@@ -29,6 +29,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ existing });
   } catch (e) {
     console.error("check failed", e);
-    return NextResponse.json({ error: "Lookup failed." }, { status: 500 });
+    return NextResponse.json(
+      { error: e instanceof Error ? e.message : "Lookup failed." },
+      { status: 500 }
+    );
   }
 }

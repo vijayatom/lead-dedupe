@@ -50,6 +50,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ inserted });
   } catch (e) {
     console.error("commit failed", e);
-    return NextResponse.json({ error: "Save failed." }, { status: 500 });
+    return NextResponse.json(
+      { error: e instanceof Error ? e.message : "Save failed." },
+      { status: 500 }
+    );
   }
 }

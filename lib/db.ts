@@ -23,26 +23,45 @@ function useBlob() {
   return !!process.env.BLOB_READ_WRITE_TOKEN;
 }
 
+/**
+ * Reads a blob, or throws.
+ *
+ * CRITICAL: this used to swallow every error and return `fallback` ({}). Since
+ * `commitEmails` does read-modify-write on the whole email map, a transient
+ * read failure would return {} and then overwrite the store with only the new
+ * rows — destroying every existing email. A missing key still returns the
+ * fallback, but a *failed read* must never be indistinguishable from empty.
+ */
 async function readBlob<T>(key: string, fallback: T): Promise<T> {
-  try {
-    const blobs = await list({ prefix: key });
-    const hit = blobs.blobs.find((b) => b.pathname === key);
-    if (!hit) return fallback;
-    // Private blobs need auth on read: signed downloadUrl alone 403s from
-    // some networks, so always send the RW token when we have it.
-    const headers: Record<string, string> = {};
-    if (process.env.BLOB_READ_WRITE_TOKEN) {
-      headers.Authorization = `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}`;
-    }
-    const res = await fetch(hit.downloadUrl || hit.url, {
-      headers,
-      cache: "no-store",
-    });
-    if (!res.ok) return fallback;
-    return (await res.json()) as T;
-  } catch {
-    return fallback;
+  const blobs = await list({ prefix: key });
+  const hit = blobs.blobs.find((b) => b.pathname === key);
+  if (!hit) return fallback;
+  // Private blobs need auth on read: signed downloadUrl alone 403s from
+  // some networks, so always send the RW token when we have it.
+  const headers: Record<string, string> = {};
+  if (process.env.BLOB_READ_WRITE_TOKEN) {
+    headers.Authorization = `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}`;
   }
+  const res = await fetch(hit.downloadUrl || hit.url, {
+    headers,
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(`Blob read failed for ${key}: HTTP ${res.status}`);
+  }
+  return (await res.json()) as T;
+}
+
+/**
+ * readBlob returns `{}` both when the key is legitimately absent and when the
+ * payload is corrupt. Committing against that would wipe the store, so a
+ * read-modify-write refuses to proceed on a non-object payload.
+ */
+function asStore(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Email store is not a valid object — refusing to overwrite it.");
+  }
+  return value as Record<string, string>;
 }
 
 async function writeBlob(key: string, value: unknown) {
@@ -86,7 +105,7 @@ export async function checkEmails(
   const uniq = Array.from(new Set(emails.map((e) => e.toLowerCase())));
   if (uniq.length === 0) return [];
   if (useBlob()) {
-    const store = await readBlob<Record<string, string>>(EMAILS_KEY, {});
+    const store = asStore(await readBlob<unknown>(EMAILS_KEY, {}));
     return uniq
       .filter((e) => e in store)
       .map((e) => ({ email: e, campaign: store[e] }));
@@ -116,7 +135,9 @@ export async function commitEmails(
     created_at: new Date().toISOString(),
   };
   if (useBlob()) {
-    const store = await readBlob<Record<string, string>>(EMAILS_KEY, {});
+    // Read first. If this throws, we never reach writeBlob — that is the whole
+    // point: a failed read must not be able to truncate the store.
+    const store = asStore(await readBlob<unknown>(EMAILS_KEY, {}));
     let inserted = 0;
     for (const [email, campaign] of Array.from(uniq.entries())) {
       if (!(email in store)) {
@@ -147,10 +168,11 @@ export async function commitEmails(
 
 export async function getStats() {
   if (useBlob()) {
-    const [store, camps] = await Promise.all([
-      readBlob<Record<string, string>>(EMAILS_KEY, {}),
+    const [raw, camps] = await Promise.all([
+      readBlob<unknown>(EMAILS_KEY, {}),
       readBlob<Campaign[]>(CAMPAIGNS_KEY, []),
     ]);
+    const store = asStore(raw);
     return {
       totalEmails: Object.keys(store).length,
       campaigns: [...camps].reverse().slice(0, 20),

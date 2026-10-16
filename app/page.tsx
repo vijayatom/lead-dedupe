@@ -7,7 +7,8 @@ import { detectEmailColumn, normalizeEmail } from "@/lib/email";
 type Row = Record<string, string>;
 type Dup = { email: string; campaign: string };
 
-type Phase = "idle" | "parsing" | "checking" | "done" | "error";
+type Phase = "idle" | "parsing" | "checking" | "saving" | "done" | "error";
+type SaveState = "idle" | "saving" | "saved" | "error";
 
 export default function Home() {
   const [phase, setPhase] = useState<Phase>("idle");
@@ -18,10 +19,12 @@ export default function Home() {
   const [scanned, setScanned] = useState(0);
   const [noEmail, setNoEmail] = useState(0);
   const [dups, setDups] = useState<Dup[]>([]);
+  const [dupRows, setDupRows] = useState<Row[]>([]);
   const [newRows, setNewRows] = useState<Row[]>([]);
   const [newEmails, setNewEmails] = useState<string[]>([]);
-  const [committed, setCommitted] = useState<number | null>(null);
-  const [committing, setCommitting] = useState(false);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [savedCount, setSavedCount] = useState<number | null>(null);
+  const [saveError, setSaveError] = useState("");
   const [dbTotal, setDbTotal] = useState<number | null>(null);
   const [dbOk, setDbOk] = useState<boolean | null>(null);
   const [dragHot, setDragHot] = useState(false);
@@ -45,9 +48,12 @@ export default function Home() {
     setError("");
     setFileName("");
     setDups([]);
+    setDupRows([]);
     setNewRows([]);
     setNewEmails([]);
-    setCommitted(null);
+    setSaveState("idle");
+    setSavedCount(null);
+    setSaveError("");
   };
 
   const handleFile = useCallback((file: File) => {
@@ -102,28 +108,70 @@ export default function Home() {
             existing.map((e) => [e.email.toLowerCase(), e.campaign])
           );
           const dupList: Dup[] = [];
+          const dupRowsOut: Row[] = [];
           const freshRows: Row[] = [];
           const freshEmails: string[] = [];
           const seenNew = new Set<string>();
+          // Sets, not Array.some — the old O(n^2) scan stalled on large files.
+          const dupSeen = new Set<string>();
           rows.forEach((r, i) => {
             const e = rowEmail[i];
             if (!e) return; // skipped, counted above
             if (existSet.has(e)) {
-              if (!dupList.some((d) => d.email === e))
+              // Already in the DB: list it AND keep the original row so it can
+              // be exported with all its columns.
+              if (!dupSeen.has(e)) {
+                dupSeen.add(e);
                 dupList.push({ email: e, campaign: existByEmail.get(e) ?? "" });
+                dupRowsOut.push(r);
+              }
             } else if (!seenNew.has(e)) {
               seenNew.add(e);
               freshRows.push(r);
               freshEmails.push(e);
             } else {
-              // duplicate within the uploaded file itself -> also a dup
-              if (!dupList.some((d) => d.email === e))
+              // duplicate within the uploaded file itself -> also a dup.
+              // Not added to dupRowsOut: it was never in the database, so it is
+              // not part of the "existing leads" export.
+              if (!dupSeen.has(e)) {
+                dupSeen.add(e);
                 dupList.push({ email: e, campaign: "this file" });
+              }
             }
           });
           setDups(dupList);
+          setDupRows(dupRowsOut);
           setNewRows(freshRows);
           setNewEmails(freshEmails);
+
+          // Save to the database straight away — not on download.
+          setPhase("saving");
+          setSaveState("saving");
+          // Use file.name, not the `fileName` state: this runs inside a
+          // useCallback([]), so the state value would be a stale "" here.
+          const base = file.name.replace(/\.csv$/i, "") || "upload";
+          try {
+            const cr = await fetch("/api/commit", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                emails: freshEmails.map((e) => ({ email: e, campaign: base })),
+                campaign: base,
+                totalRows: rows.length,
+                dupCount: dupList.length,
+              }),
+            });
+            const cj = await cr.json().catch(() => ({}));
+            if (!cr.ok) throw new Error(cj.error || "Could not save to the database.");
+            setSavedCount(typeof cj.inserted === "number" ? cj.inserted : 0);
+            setSaveState("saved");
+            const s = await fetch("/api/stats").then((r) => r.json());
+            if (typeof s.totalEmails === "number") setDbTotal(s.totalEmails);
+          } catch (e) {
+            // Results stay usable even if the save failed.
+            setSaveError(e instanceof Error ? e.message : "Could not save to the database.");
+            setSaveState("error");
+          }
           setPhase("done");
         } catch (err) {
           setError(err instanceof Error ? err.message : "Something went wrong.");
@@ -137,41 +185,24 @@ export default function Home() {
     });
   }, []);
 
-  const download = async () => {
-    if (newRows.length === 0) return;
-    // Build CSV client-side: duplicates removed, rows closed up, all columns kept.
-    const csv = Papa.unparse(newRows, { columns: headers });
+  // Pure client-side CSV export. No DB work — everything is already saved.
+  const downloadRows = (rows: Row[], suffix: string) => {
+    if (rows.length === 0) return;
+    const csv = Papa.unparse(rows, { columns: headers });
+    // BOM so Excel opens UTF-8 correctly.
     const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     const base = fileName.replace(/\.csv$/i, "") || "leads";
     a.href = url;
-    a.download = `${base}-new.csv`;
+    a.download = `${base}-${suffix}.csv`;
     a.click();
-    URL.revokeObjectURL(url);
-    // Save new leads to DB on download.
-    setCommitting(true);
-    try {
-      const res = await fetch("/api/commit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          emails: newEmails.map((e) => ({ email: e, campaign: base })),
-          campaign: base,
-          totalRows: scanned,
-          dupCount: dups.length,
-        }),
-      });
-      const j = await res.json();
-      setCommitted(typeof j.inserted === "number" ? j.inserted : newEmails.length);
-      const s = await fetch("/api/stats").then((r) => r.json());
-      if (typeof s.totalEmails === "number") setDbTotal(s.totalEmails);
-    } catch {
-      setCommitted(newEmails.length);
-    } finally {
-      setCommitting(false);
-    }
+    // Revoke on the next tick; revoking synchronously can abort large files.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
+
+  const downloadNew = () => downloadRows(newRows, "new");
+  const downloadExisting = () => downloadRows(dupRows, "existing");
 
   return (
     <main style={S.main}>
@@ -222,10 +253,14 @@ export default function Home() {
           {fileName && <div style={S.fileRow}>File: {fileName}</div>}
         </section>
 
-        {(phase === "parsing" || phase === "checking") && (
+        {(phase === "parsing" || phase === "checking" || phase === "saving") && (
           <section style={S.card}>
             <div style={{ fontSize: 14 }}>
-              {phase === "parsing" ? "Reading CSV…" : `Checking ${scanned.toLocaleString()} emails against the database…`}
+              {phase === "parsing"
+                ? "Reading CSV…"
+                : phase === "checking"
+                ? `Checking ${scanned.toLocaleString()} emails against the database…`
+                : "Updating the database…"}
             </div>
           </section>
         )}
@@ -256,6 +291,12 @@ export default function Home() {
                       {dups.length}
                     </span>
                   </div>
+                  {dups.length > dupRows.length && (
+                    <div style={S.hint}>
+                      {dupRows.length.toLocaleString()} already in the database,{" "}
+                      {dups.length - dupRows.length} repeated inside this file.
+                    </div>
+                  )}
                   <div style={S.list}>
                     {dups.length === 0 && <div style={S.empty}>None — all fresh.</div>}
                     {dups.slice(0, 500).map((d) => (
@@ -293,25 +334,50 @@ export default function Home() {
 
             <section style={S.card}>
               <h2 style={S.h2}>3 · Download</h2>
+
+              {/* DB update notification */}
+              {saveState === "saved" && savedCount !== null && (
+                <div style={{ ...S.banner, ...S.bannerOk }}>
+                  <span style={S.bannerIcon}>✓</span>
+                  <span>
+                    <strong>Database updated</strong> —{" "}
+                    {savedCount === 0
+                      ? "0 new leads. Everything in this file was already in the database."
+                      : `${savedCount.toLocaleString()} new lead${
+                          savedCount === 1 ? "" : "s"
+                        } saved from "${fileName}".`}
+                  </span>
+                </div>
+              )}
+              {saveState === "error" && (
+                <div style={{ ...S.banner, ...S.bannerBad }}>
+                  <span style={S.bannerIcon}>!</span>
+                  <span>
+                    <strong>Database not updated</strong> — {saveError} The results below are
+                    still correct, but re-upload this file to save it.
+                  </span>
+                </div>
+              )}
+
               <div style={S.btns}>
-                <button style={S.btnP} onClick={download} disabled={committing || newRows.length === 0}>
-                  {committing
-                    ? "Saving…"
-                    : `Download ${newRows.length.toLocaleString()} new leads (CSV)`}
+                <button style={S.btnP} onClick={downloadNew} disabled={newRows.length === 0}>
+                  Download {newRows.length.toLocaleString()} new leads (CSV)
+                </button>
+                <button
+                  style={S.btnE}
+                  onClick={downloadExisting}
+                  disabled={dupRows.length === 0}
+                >
+                  Download {dupRows.length.toLocaleString()} existing leads (CSV)
                 </button>
                 <button style={S.btnS} onClick={reset}>
                   Upload another file
                 </button>
               </div>
-              {committed !== null && (
-                <div style={{ ...S.note, color: "#4ade80" }}>
-                  Saved {committed.toLocaleString()} new leads to the database.
-                </div>
-              )}
               <div style={S.note}>
                 Duplicate rows are deleted and remaining rows shift up — no blank gaps. All
-                original columns are kept. New leads are saved to the database when you
-                download.
+                original columns are kept. <strong>New leads are saved to the database as soon
+                as you upload</strong> — you do not need to download them.
               </div>
             </section>
           </>
@@ -414,6 +480,13 @@ const S: Record<string, React.CSSProperties> = {
   },
   tag: { fontSize: 10.5, color: "#6b7280", whiteSpace: "nowrap", flexShrink: 0 },
   empty: { padding: "12px 14px", color: "#6b7280", fontSize: 12.5 },
+  hint: {
+    padding: "9px 14px",
+    color: "#8b93a1",
+    fontSize: 12,
+    background: "#0f1219",
+    borderBottom: "1px solid #191d25",
+  },
   btns: { display: "flex", gap: 10, marginTop: 18, alignItems: "center", flexWrap: "wrap" },
   btnP: {
     padding: "10px 18px",
@@ -434,6 +507,48 @@ const S: Record<string, React.CSSProperties> = {
     background: "#1c2029",
     color: "#c9d1d9",
     border: "1px solid #2e3441",
+  },
+  btnE: {
+    padding: "10px 18px",
+    borderRadius: 8,
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+    background: "#3a1d20",
+    color: "#fca5a5",
+    border: "1px solid #7f1d1d",
+  },
+  banner: {
+    display: "flex",
+    gap: 11,
+    alignItems: "flex-start",
+    padding: "12px 14px",
+    borderRadius: 10,
+    fontSize: 13,
+    lineHeight: 1.45,
+    marginBottom: 14,
+  },
+  bannerOk: {
+    background: "#10291b",
+    border: "1px solid #22c55e",
+    color: "#a7f3d0",
+  },
+  bannerBad: {
+    background: "#2a1414",
+    border: "1px solid #ef4444",
+    color: "#fecaca",
+  },
+  bannerIcon: {
+    flexShrink: 0,
+    width: 20,
+    height: 20,
+    borderRadius: "50%",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontWeight: 700,
+    fontSize: 12,
+    background: "rgba(255,255,255,0.12)",
   },
   note: { fontSize: 12, color: "#6b7280", marginTop: 12 },
 };
